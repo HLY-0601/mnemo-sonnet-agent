@@ -39,7 +39,6 @@ from typing import Any, Dict, List, Optional
 from sea.model.base import GenerationConfig, Message, ModelBackend
 from sea.model.numpy_backend import NumpyBackend
 
-
 # 阶段1 的提示：明确说「不要输出 JSON」，只要结论。
 # 这是级联的关键 —— 不再要求推理模型做它不擅长的事。
 _PLANNER_TEMPLATE = """你是一个任务分析器。从下面的工具清单里选出该用的工具，并给出参数。
@@ -60,10 +59,18 @@ _PLANNER_TEMPLATE = """你是一个任务分析器。从下面的工具清单里
 工具名：calculator
 参数：(17 + 88) * 4
 
+用户：上次我们是怎么配置 Nginx 的？
+工具名：memory_search
+参数：Nginx
+
+⚠️ 特别注意 search 与 memory_search 的区别：
+- 用户问「什么是X / 查查X / 了解X」= 查新知识 → 用 search
+- 用户说「上次 / 以前 / 记得吗」= 翻自己的历史 → 用 memory_search
+
 不要输出 JSON，不要自己计算，不要解释。只要上面两行。"""
 
 
-def planner_prompt() -> str:
+def planner_prompt(tools: Optional[List[str]] = None) -> str:
     """生成 planner 的 system prompt：工具清单 + 格式示例。
 
     两处都是踩过坑才加的：
@@ -77,15 +84,20 @@ def planner_prompt() -> str:
     推理模型的弱项是结构化输出，但填两行标签是它做得到的。
     """
     try:
-        from sea.agent.tools import tools_prompt
-        tools = tools_prompt()
+        from sea.agent.tools import list_tools
+        items = list_tools()
+        if tools:      # 白名单：只暴露用得到的工具，减少小模型的混淆面
+            items = [t for t in items if t["name"] in set(tools)]
+        tools_txt = "\n".join(
+            f"- {t['name']}({', '.join(t['args'].keys())}): {t['description']}"
+            for t in items)
     except Exception:
-        tools = ("- calculator(expression): 计算算术表达式\n"
-                 "- search(query): 检索资料\n"
-                 "- file_write(path): 写文件\n"
-                 "- file_read(path): 读文件\n"
-                 "- python_exec(code): 执行 Python 代码")
-    return _PLANNER_TEMPLATE.format(tools=tools)
+        tools_txt = ("- calculator(expression): 计算算术表达式\n"
+                    "- search(query): 检索资料\n"
+                    "- file_write(path): 写文件\n"
+                    "- file_read(path): 读文件\n"
+                    "- python_exec(code): 执行 Python 代码")
+    return _PLANNER_TEMPLATE.format(tools=tools_txt)
 
 
 # 工具名 → (识别关键词, 参数键)
@@ -145,8 +157,9 @@ class CascadeBackend(ModelBackend):
     name = "cascade"
 
     def __init__(self, planner: ModelBackend, formatter: Optional[ModelBackend] = None,
-                 verbose: bool = False):
+                 verbose: bool = False, tools: Optional[List[str]] = None):
         self.planner = planner
+        self.tools = tools          # 给 planner 看的工具白名单，None = 全部
         self.formatter = formatter
         self.verbose = verbose
         self.model_name_or_path = f"cascade({planner.name}+{formatter.name if formatter else 'rule'})"
@@ -240,20 +253,16 @@ class CascadeBackend(ModelBackend):
         #      匹配中文，"什么是Nginx" 会被当成一整个词，导致 Nginx 匹配不上。
         # 所以这里显式按「ASCII 词 / 中文串」分词，中文视为分隔符。
         words = _tokenize_for_match(task)
-
-        cands = re.findall(r'["\'“”]([^"\'“”]{1,120})["\'“”]', plan)
+        cands = re.findall(r'["\'“"]([^"\'“”]{1,120})["\'“”]', plan)
         cands += re.findall(r"[A-Za-z_][\w.\-]*", plan)
         cands += re.findall(r"[\u4e00-\u9fa5]{2,8}", plan)
-
         best = ""
         for c in cands:
             c = c.strip()
             if len(c) > len(best) and c in words:
                 best = c
-
         if not best:
             return None
-
         return {"tool": tool, "args": {arg_key: best}}
 
     # ---------------- 主入口 ----------------
@@ -305,11 +314,10 @@ class CascadeBackend(ModelBackend):
         `generate(messages)`。带 config 失败时降级重试 —— 否则会静默退化成
         「planner 没起作用」，表面看只是打分低，很难排查（实测踩过）。
         """
-        msgs = [{"role": "system", "content": planner_prompt()},
+        msgs = [{"role": "system", "content": planner_prompt(self.tools)},
                 {"role": "user", "content": task}]
         cfg = GenerationConfig(temperature=0.2, max_tokens=512)
         last = None
-
         for call in (lambda: self.planner.generate(msgs, config=cfg),
                      lambda: self.planner.generate(msgs)):
             try:
@@ -325,7 +333,6 @@ class CascadeBackend(ModelBackend):
                 if self.verbose:
                     print(f"[cascade] planner 故障: {type(e).__name__}: {e}")
                 return ""
-
         self.last_source = "planner_error"
         if self.verbose:
             print(f"[cascade] planner 无有效输出: {last}")
@@ -368,5 +375,4 @@ def build_cascade(planner_kind: str = "mock", api_model: str = "deepseek-chat",
             formatter = NumpyBackend(formatter_path, constrained=True)
         except Exception as e:
             print(f"⚠️ 协议层加载失败，退化为纯规则: {e}")
-
     return CascadeBackend(planner=planner, formatter=formatter, verbose=verbose)
