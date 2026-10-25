@@ -74,6 +74,29 @@ _ARG_KEY_OF = {
 }
 
 
+def _tokenize_for_match(text: str):
+    """把文本切成候选词：连续的 ASCII 词（含 . _ -）算一个词，中文单独成词。
+
+    关键点：**中文算分隔符**。Python 的 `\\w` 默认匹配中文，
+    `re.split(r"[^\\w.\\-]+")` 会把 "什么是Nginx" 当成一整块，
+    导致 "Nginx" 永远匹配不上（实测踩过）。
+    """
+    out, buf = [], ""
+    for ch in text:
+        if ord(ch) < 128 and (ch.isalnum() or ch in "._-"):
+            buf += ch
+        else:
+            if buf:
+                out.append(buf)
+                buf = ""
+            if ord(ch) >= 128 and not ch.isspace():
+                # 连续中文作为整体（用于中文参数），但也可逐字匹配
+                out.append(ch)
+    if buf:
+        out.append(buf)
+    return out
+
+
 class CascadeBackend(ModelBackend):
     """planner（会想） + 协议层（会写）级联。
 
@@ -145,11 +168,14 @@ class CascadeBackend(ModelBackend):
 
         # 其它：参数必须是任务里的【完整词】。
         #
-        # ⚠️ 这里不能用朴素 `in` 子串判断 —— 实测踩过：planner 说「调用 search 工具」，
-        #    任务里是 "什么是Elasticsearch？"，而 "search" 恰好是 "Elasticsearch" 的
-        #    子串，朴素检查放行，参数被错写成 "search"。
-        #    必须按分隔符切词后做整词匹配（与约束解码里的词边界是同一个教训）。
-        words = [w for w in re.split(r"[^\w.\-]+", task) if w]
+        # ⚠️ 两处都踩过坑，都是同一个根因（字符串匹配必须用词边界）：
+        #   1. 朴素 `in` 子串判断会放行陷阱 —— planner 说「调用 search 工具」，
+        #      任务里是 "什么是Elasticsearch？"，"search" 恰好是其子串，
+        #      会被错当成参数。
+        #   2. `re.split(r"[^\w.\-]+")` 切不开中文+英文 —— Python 的 \w 默认
+        #      匹配中文，"什么是Nginx" 会被当成一整个词，导致 Nginx 匹配不上。
+        # 所以这里显式按「ASCII 词 / 中文串」分词，中文视为分隔符。
+        words = _tokenize_for_match(task)
 
         cands = re.findall(r'["\'“”]([^"\'“”]{1,120})["\'“”]', plan)
         cands += re.findall(r"[A-Za-z_][\w.\-]*", plan)
