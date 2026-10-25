@@ -41,7 +41,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sea.model.base import ModelBackend  # noqa: E402
-from sea.model.cascade import CascadeBackend, PLANNER_SYSTEM  # noqa: E402
+from sea.model.cascade import CascadeBackend  # noqa: E402
 from sea.model.numpy_backend import NumpyBackend  # noqa: E402
 
 
@@ -81,18 +81,21 @@ class _DemoPlanner(ModelBackend):
         t = messages[-1]["content"]
         if any(k in t for k in ("什么是", "查查", "了解", "讲讲", "介绍")):
             w = re.findall(r"[A-Za-z][A-Za-z0-9_.\-]*", t)
-            return (f"这是查找资料的任务。用户在问一个概念的含义。"
-                    f"应该调用 search 工具，检索的关键词是「{w[-1] if w else '未知'}」。")
+            return f"工具名：search\n参数：{w[-1] if w else '未知'}"
         if any(k in t for k in ("计算", "算", "得多少", "等于多少")):
-            return "这是数值计算任务。不要自己心算，应该调用 calculator 工具，" \
-                   "把用户给出的数学表达式原样传给工具。"
+            m = re.search(r"\(?\s*\d[\d\s+\-*/().]*\d\s*\)?", t)
+            return f"工具名：calculator\n参数：{m.group(0).strip() if m else ''}"
         if any(k in t for k in ("写入", "创建", "导出", "新建", "生成")):
             f = re.findall(r"[\w\-.]+\.\w+", t)
-            return (f"这是写文件的任务。应该调用 file_write 工具，"
-                    f"目标文件名是「{f[0] if f else 'output.txt'}」。")
+            return f"工具名：file_write\n参数：{f[0] if f else 'output.txt'}"
         if any(k in t for k in ("执行", "运行", "跑")):
-            return "这是执行代码的任务。应该调用 python_exec 工具，把用户给出的代码原样传入。"
-        return "任务类型不明确，无法判断该用什么工具。"
+            body = t
+            for v in ("执行代码", "运行代码", "执行", "运行", "跑一下", "跑"):
+                if body.startswith(v):
+                    body = body[len(v):]
+                    break
+            return f"工具名：python_exec\n参数：{body.strip()}"
+        return "工具名：未知"
 
 
 def build(kind: str, model: str, evo_path: str, verbose: bool):
@@ -157,6 +160,7 @@ def main() -> None:
     backend = build(args.planner, args.model, args.evo, args.verbose)
     if args.planner != "none":
         score(backend, f"级联（planner={args.planner}/{args.model}）", args.verbose)
+        # 对照：只用协议层
         if os.path.exists(args.evo):
             score(NumpyBackend(args.evo, constrained=True), "对照：协议层单独")
     else:
