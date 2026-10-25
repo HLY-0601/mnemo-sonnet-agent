@@ -81,6 +81,29 @@ _ARG_KEY_OF = {
     "memory_remember": "text",
 }
 
+
+def _certain_tool(task: str) -> Optional[str]:
+    """任务特征**唯一确定**工具时返回工具名，否则 None。
+
+    这是规则层唯一允许「覆盖 planner」的地方，条件极严：
+    只看任务本身的**硬特征**，不猜语义、不碰 planner 的输出。
+
+    目前只有一条规则成立：任务里出现代码关键字（print( / import ...）
+    → 一定是要执行代码，绝不可能是算算术或查资料。
+
+    为什么要它：实测 0.5B 稳定地把「执行 print(1+1)」判成 calculator
+    并抠出 "1+1"。数值恰好一样，但工具语义是错的 —— 代码该进沙箱跑，
+    不该被当成纯算术表达式求值。这条**有真实危害**，值得覆盖。
+
+    为什么不做更多：一旦开始「猜语义」（如"讲讲X 应该是 search"），
+    规则层就从「执行者」变成「判断者」，planner 的存在意义被架空，
+    而且会破坏「规则层不编造」的铁律。所以只保留这一条硬特征规则。
+    """
+    if _has_code_keyword(task):
+        return "python_exec"
+    return None
+
+
 _CODE_HINTS = ("print(", "import ", "def ", "for ", "while ", "len(", "range(",
                "sum(", "list(", "dict(", "set(", "open(", "os.", "sys.")
 
@@ -158,8 +181,6 @@ class CascadeBackend(ModelBackend):
         arg_key = _ARG_KEY_OF[tool]
 
         if tool == "calculator":
-            # 互斥检查：任务里若含代码关键字（print / import ...），
-            # 说明用户在让**执行代码**，不是让算算术
             if _has_code_keyword(task):
                 return None
             m = re.search(r"\(?\s*\d[\d\s+\-*/().]*\d\s*\)?", task)
@@ -168,8 +189,6 @@ class CascadeBackend(ModelBackend):
             return {"tool": tool, "args": {arg_key: m.group(0).strip()}}
 
         if tool == "python_exec":
-            # 必须先确认任务里**真的有代码**：0.5B 会把「查查 Zyzzogeton」
-            # 判成 python_exec 并自己编 print('Zyzzogeton')
             if not _looks_like_code(task):
                 return None
             body = task
@@ -216,6 +235,23 @@ class CascadeBackend(ModelBackend):
         if self.verbose:
             print(f"[cascade] 阶段1 推理:\n{plan[:400]}")
 
+        # 阶段2a：确定性纠正 —— 任务硬特征唯一确定工具时，覆盖 planner
+        certain = _certain_tool(task)
+        if certain is not None:
+            self.last_source = "rule_certain"
+            if self.verbose:
+                print(f"[cascade] 确定性纠正: planner 说 "
+                      f"{self._tool_in(plan)} → 按任务硬特征改为 {certain}")
+            hit2 = self._extract(f"工具名：{certain}", task)
+            if hit2:
+                return json.dumps(
+                    {"thought": f"任务含代码特征，规则层判定为 {certain}"
+                                f"（planner 原判 {self._tool_in(plan)}）",
+                     "action": {"tool": certain, "args": hit2["args"]}},
+                    ensure_ascii=False)
+            self.last_source = ""
+
+        # 阶段2b：规则提取（忠于输入，零幻觉）
         hit = self._extract(plan, task)
         if hit:
             self.last_source = "rule"
@@ -266,6 +302,11 @@ class CascadeBackend(ModelBackend):
         if self.verbose:
             print(f"[cascade] planner 无有效输出: {last}")
         return ""
+
+    @staticmethod
+    def _tool_in(plan: str) -> str:
+        m = re.search(r"工具名\s*[:：]\s*([A-Za-z_]\w*)", plan)
+        return m.group(1) if m else "?"
 
     @staticmethod
     def _task_of(messages: List[Message]) -> str:
