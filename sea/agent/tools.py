@@ -1,10 +1,6 @@
-"""工具注册表：Agent 能调用的原子能力。
-
-新增工具只需 @register_tool 装饰一个 run(**kwargs) -> str 的函数。
-"""
+"""工具注册表：Agent 能调用的原子能力。"""
 from __future__ import annotations
 
-import json
 import os
 import threading
 from typing import Any, Callable, Dict, List, Optional
@@ -13,10 +9,7 @@ from ..types import MemoryLayer
 from ..util import safe_eval, safe_exec
 
 ToolFn = Callable[..., str]
-
 _REGISTRY: Dict[str, Dict[str, Any]] = {}
-
-# 工作区根目录用线程局部变量：多 Agent 并行时，每个 worker 写自己隔离的目录，互不串味
 _LOCAL = threading.local()
 DEFAULT_ROOT = "data/workspaces/main"
 
@@ -30,7 +23,6 @@ def set_workspace_root(path: str) -> None:
 
 
 def register_tool(name: str, description: str, args: Dict[str, str], schema_only: bool = False):
-    """args: {参数名: 说明}"""
     def deco(fn: ToolFn) -> ToolFn:
         _REGISTRY[name] = {"fn": fn, "description": description, "args": args}
         return fn
@@ -57,8 +49,6 @@ def run_tool(name: str, **kwargs) -> str:
         return f"[工具异常] {type(e).__name__}: {e}"
 
 
-# ------------------------------ 内置工具 ------------------------------
-
 @register_tool("calculator", "计算算术表达式，如 (12+8)*3/5", {"expression": "算术表达式"})
 def calculator(expression: str) -> str:
     try:
@@ -67,23 +57,14 @@ def calculator(expression: str) -> str:
         return f"[计算失败] {e}"
 
 
-@register_tool("python_exec", "在受限沙箱中执行 Python 代码片段，用 print 输出结果", {"code": "Python 代码"})
+@register_tool("python_exec", "【只有用户直接给代码时才用】在受限沙箱中执行 Python 代码片段。"
+                "用户说「查查X / 了解X」时用 search，不要自己写 print", {"code": "Python 代码"})
 def python_exec(code: str) -> str:
     _, out = safe_exec(code)
     return out.strip() or "(无输出)"
 
 
 def _resolve_path(path: str, root: Optional[str]) -> tuple:
-    """解析工作区内路径，返回 (绝对路径, 工作区内相对路径)。
-
-    坑（实测踩过）：工具把路径写进观察结果，模型下一轮把它抄成 path，
-    os.path.join 再拼一次 root → data/ws/data/ws/report.md，每重试多一层。
-    所以要做两件事：
-    1) 反复剥离重复出现的 root 前缀。注意 root 既可能是绝对路径，也可能是
-       相对路径（默认 "data/workspaces/main"），模型抄回来的通常是相对形式，
-       两种都要剥 —— 只剥绝对形式是剥不掉的（第一版就错在这）。
-    2) 观察里只回传相对路径，避免持续污染上下文。
-    """
     raw_root = root or get_workspace_root()
     base = os.path.abspath(raw_root)
     p = (path or "").strip().replace("\\", "/")
@@ -92,7 +73,7 @@ def _resolve_path(path: str, root: Optional[str]) -> tuple:
         c = (cand or "").replace("\\", "/").rstrip("/")
         if c and c not in prefixes:
             prefixes.append(c)
-    for _ in range(8):                       # 上限防止死循环
+    for _ in range(8):
         hit = False
         for pre in prefixes:
             if p == pre:
@@ -105,7 +86,6 @@ def _resolve_path(path: str, root: Optional[str]) -> tuple:
             break
     p = p.lstrip("/") or "."
     ap = os.path.abspath(os.path.join(base, p))
-    # 越界访问（../ 或绝对路径逃出工作区）一律拉回工作区内
     if not (ap.startswith(base + os.sep) or ap == base):
         ap = os.path.join(base, os.path.basename(p))
     return ap, os.path.relpath(ap, base)
@@ -115,11 +95,10 @@ def _resolve_path(path: str, root: Optional[str]) -> tuple:
 def file_write(path: str, content: Optional[str] = None, root: Optional[str] = None) -> str:
     full, rel = _resolve_path(path, root)
     os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
-    if content is None:      # 小模型常常只给 path，这里兜底而不是报错
+    if content is None:
         content = f"# {rel}\n\n（由 Agent 创建，内容待补充）\n"
     with open(full, "w", encoding="utf-8") as f:
         f.write(content)
-    # 只回传相对路径：绝对路径会被模型抄进下一轮的 path 参数，导致无限嵌套
     return f"已写入 {rel}（{len(content)} 字符）"
 
 
@@ -132,15 +111,14 @@ def file_read(path: str, root: Optional[str] = None) -> str:
         return f.read()
 
 
-# 极简离线知识库：无网络时也能演示检索；有 SEA_SEARCH_FN 时可替换为真实检索
 _KB = {
-    "transformer": "Transformer 由 Vaswani 等人在 2017 年提出，核心是自注意力机制，取代了 RNN 的序列依赖。",
-    "lora": "LoRA 通过低秩矩阵分解微调，只训练 A/B 两个小矩阵，显存与算力开销远低于全参数微调。",
-    "react": "ReAct 让模型交替输出思考(Thought)与行动(Action)，把推理与外部工具调用交织在一起。",
-    "reflexion": "Reflexion 让 Agent 对失败轨迹做语言反思，把反思文本作为下一轮尝试的上下文，不改动模型权重。",
-    "mem0": "mem0 是面向 Agent 的记忆层，提供跨会话的事实抽取、更新与检索，支持向量与图存储。",
-    "graphiti": "Graphiti 构建带双时序边的知识图谱，能回答『某个时间点系统知道什么』这类历史查询。",
-    "voyager": "Voyager 用可执行技能库积累能力：技能含代码、描述与验证测试，成功后永久复用。",
+    "transformer": "Transformer 由 Vaswani 等人在 2017 年提出，核心是自注意力机制。",
+    "lora": "LoRA 通过低秩矩阵分解微调，只训练 A/B 两个小矩阵。",
+    "react": "ReAct 让模型交替输出思考(Thought)与行动(Action)。",
+    "reflexion": "Reflexion 让 Agent 对失败轨迹做语言反思，不改动模型权重。",
+    "mem0": "mem0 是面向 Agent 的记忆层，提供跨会话的事实抽取与检索。",
+    "graphiti": "Graphiti 构建带双时序边的知识图谱。",
+    "voyager": "Voyager 用可执行技能库积累能力。",
 }
 
 
@@ -161,7 +139,6 @@ _GLOBAL_MEMORY = None
 
 
 def bind_memory(memory) -> None:
-    """把记忆引擎绑定到工具层，供 memory_search / memory_remember 使用。"""
     global _GLOBAL_MEMORY
     _GLOBAL_MEMORY = memory
 
