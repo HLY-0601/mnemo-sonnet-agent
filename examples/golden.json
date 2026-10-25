@@ -1,0 +1,6 @@
+[
+  {"task": "计算 5 * 6 等于多少？", "expected": "30"},
+  {"task": "计算 100 - 37 等于多少？", "expected": "63"},
+  {"task": "什么是 ReAct？", "expected": "ReAct"},
+  {"task": "计算 256 / 8 等于多少？", "expected": "32"}
+]

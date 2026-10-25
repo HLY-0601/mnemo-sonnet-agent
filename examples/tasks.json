@@ -1,0 +1,6 @@
+[
+  {"task": "计算 (128 + 72) * 3 等于多少？", "expected": "600"},
+  {"task": "什么是 LoRA？", "expected": "LoRA"},
+  {"task": "把结果写入 report.md", "expected": "report.md"},
+  {"task": "计算 100 / 4 等于多少？", "expected": "25"}
+]

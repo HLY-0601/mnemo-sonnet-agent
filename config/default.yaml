@@ -1,0 +1,29 @@
+# SEA 默认配置
+workdir: data
+
+model:
+  family: Mnemo-Sonnet
+  kind: auto
+  name_or_path: null
+  adapter_path: null
+
+memory:
+  root: data/memory
+  embedder: hashing
+
+agent:
+  max_steps: 6
+  max_retries: 1
+  temperature: 0.2
+  reflect_on_fail: true
+  inject_memory: true
+  skill_route_min_confidence: 0.7
+  skill_route_min_score: 0.55
+
+evolution:
+  min_score_for_sft: 0.75
+  min_samples_to_train: 4
+  allow_auto_train: false
+  allow_skill_proposal: true
+  promote_min_delta: 0.0
+  circuit_break_delta: -0.05
