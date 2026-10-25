@@ -42,14 +42,50 @@ from sea.model.numpy_backend import NumpyBackend
 
 # 阶段1 的提示：明确说「不要输出 JSON」，只要结论。
 # 这是级联的关键 —— 不再要求推理模型做它不擅长的事。
-PLANNER_SYSTEM = """你是一个任务分析器。分析用户的任务，判断应该调用哪个工具。
+_PLANNER_TEMPLATE = """你是一个任务分析器。从下面的工具清单里选出该用的工具，并给出参数。
 
-只输出你的分析结论，用简短的自然语言说明：
-1. 这是哪一类任务（数值计算 / 查找资料 / 读写文件 / 执行代码）
-2. 应该调用哪个工具
-3. 传给工具的关键参数是什么（必须原样来自用户的任务描述，不要改写）
+可用工具（只能用这些名字，不要自己发明）：
+{tools}
 
-不要输出 JSON，不要写代码，不要执行计算，只要分析结论。"""
+按这个格式输出，两行：
+工具名：<这里填工具名>
+参数：<这里填参数值，必须原样抄自用户的任务描述，不要改写、不要翻译>
+
+示例：
+用户：什么是Elasticsearch？
+工具名：search
+参数：Elasticsearch
+
+用户：计算 (17 + 88) * 4 等于多少？
+工具名：calculator
+参数：(17 + 88) * 4
+
+不要输出 JSON，不要自己计算，不要解释。只要上面两行。"""
+
+
+def planner_prompt() -> str:
+    """生成 planner 的 system prompt：工具清单 + 格式示例。
+
+    两处都是踩过坑才加的：
+    1. **工具名清单** —— 第一版只说"应该调用哪个工具"却没给清单，
+       真模型（Qwen2.5-0.5B）于是用中文自由描述，规则层吃不到工具名，
+       10/13 全部回退。这和 Agent 那边"幻觉工具名靠 schema 修"是同一个教训。
+    2. **示例而非规则** —— 本项目已验证：小模型服从示例不服从规则。
+       所以给两条示例，而不是只写"按格式输出"。
+
+    格式上刻意用"工具名：/参数："两行，而不是完整 JSON ——
+    推理模型的弱项是结构化输出，但填两行标签是它做得到的。
+    """
+    try:
+        from sea.agent.tools import tools_prompt
+        tools = tools_prompt()
+    except Exception:
+        tools = ("- calculator(expression): 计算算术表达式\n"
+                 "- search(query): 检索资料\n"
+                 "- file_write(path): 写文件\n"
+                 "- file_read(path): 读文件\n"
+                 "- python_exec(code): 执行 Python 代码")
+    return _PLANNER_TEMPLATE.format(tools=tools)
 
 
 # 工具名 → (识别关键词, 参数键)
@@ -125,15 +161,26 @@ class CascadeBackend(ModelBackend):
 
         铁律：参数值必须原样出现在用户任务里。
         这是整个级联的安全边界 —— planner 可以「想」，但不能「编」。
-        """
-        # 1) 工具名：优先用 planner 明确写出的工具名
-        tool = None
-        for name, _ in _TOOL_HINTS:
-            if re.search(rf"\b{name}\b", plan):
-                tool = name
-                break
 
-        # 2) 退化：按关键词猜
+        识别顺序（从明确到模糊）：
+        1. `工具名：xxx` 半结构化字段（新 prompt 要求的格式，最可靠）
+        2. planner 文本里出现过的合法工具名
+        3. 中文关键词兜底
+        """
+        # 0) 优先：planner 按格式写的「工具名：xxx / 参数：xxx」
+        m_tool = re.search(r"工具名\s*[:：]\s*([A-Za-z_]\w*)", plan)
+        tool = m_tool.group(1) if m_tool else None
+        if tool is not None and tool not in _ARG_KEY_OF:
+            tool = None      # 自造的工具名 → 不认，回退兜底
+
+        # 1) 工具名：planner 明确写出的合法工具名
+        if tool is None:
+            for name in _ARG_KEY_OF:
+                if re.search(rf"\b{name}\b", plan):
+                    tool = name
+                    break
+
+        # 2) 退化：按中文关键词猜
         if tool is None:
             for name, kws in _TOOL_HINTS:
                 if any(k in plan for k in kws):
@@ -145,6 +192,9 @@ class CascadeBackend(ModelBackend):
 
         arg_key = _ARG_KEY_OF[tool]
 
+        # calculator / python_exec 的值是表达式或代码，含空格与括号，
+        # 不能用「整词匹配」——会把 "(132 + 868) * 3" 拆成 "132"。
+        # 所以这两个专用分支必须排在通用的「参数：」提取之前。
         if tool == "calculator":
             # 算术：从任务里抠表达式（允许 planner 算出的结果，但表达式必须来自任务）
             m = re.search(r"\(?\s*\d[\d\s+\-*/().]*\d\s*\)?", task)
@@ -165,6 +215,20 @@ class CascadeBackend(ModelBackend):
             if not body:
                 return None
             return {"tool": tool, "args": {arg_key: body}}
+
+        # 0b) 参数：planner 按格式写的「参数：xxx」—— 仍必须是任务里的完整词
+        #     （只对 search / file_* 等「值是一个词」的工具生效；
+        #      calculator / python_exec 已在上面专用分支返回）
+        m_arg = re.search(r"参数\s*[:：]\s*(.+)", plan)
+        if m_arg:
+            raw = m_arg.group(1).strip().strip("。.、,，\"'“”")
+            words = _tokenize_for_match(task)
+            if raw in words:
+                return {"tool": tool, "args": {arg_key: raw}}
+            # 参数里含多个词时取最长的那个（如 "report.md 的内容"）
+            for w in sorted(words, key=len, reverse=True):
+                if w in raw and len(w) > 1:
+                    return {"tool": tool, "args": {arg_key: w}}
 
         # 其它：参数必须是任务里的【完整词】。
         #
@@ -241,7 +305,7 @@ class CascadeBackend(ModelBackend):
         `generate(messages)`。带 config 失败时降级重试 —— 否则会静默退化成
         「planner 没起作用」，表面看只是打分低，很难排查（实测踩过）。
         """
-        msgs = [{"role": "system", "content": PLANNER_SYSTEM},
+        msgs = [{"role": "system", "content": planner_prompt()},
                 {"role": "user", "content": task}]
         cfg = GenerationConfig(temperature=0.2, max_tokens=512)
         last = None
