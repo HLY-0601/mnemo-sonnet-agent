@@ -22,22 +22,23 @@ _PLANNER_TEMPLATE = """你是一个任务分析器。从下面的工具清单里
 工具名：search
 参数：Elasticsearch
 
-用户：查查 Zyzzogeton
-工具名：search
-参数：Zyzzogeton
-
 用户：计算 (17 + 88) * 4 等于多少？
 工具名：calculator
 参数：(17 + 88) * 4
+
+用户：查查 Zyzzogeton
+工具名：search
+参数：Zyzzogeton
 
 用户：上次我们是怎么配置 Nginx 的？
 工具名：memory_search
 参数：Nginx
 
-⚠️ 三个容易混的地方：
-1. search vs memory_search：用户问「什么是X / 查查X / 了解X」= 查新知识 → 用 search；用户说「上次 / 以前 / 记得吗」= 翻自己的历史 → 用 memory_search
-2. search vs python_exec：用户说「查查X / 了解X / 讲讲X」= 查资料 → 用 search；只有用户**直接给出了一段代码**（如"执行 print(1+1)"）才用 python_exec
-3. calculator vs python_exec：用户说「算一下 / 等于多少」= 算数学 → 用 calculator；用户说「执行/跑一段代码」= 跑代码 → 用 python_exec
+⚠️ 特别注意这三组容易混淆的工具：
+- 「什么是X / 查查X / 了解X」= 查新知识 → search
+- 「上次 / 以前 / 记得吗」= 翻自己的历史 → memory_search
+- 只有用户原话里**已经写出代码**（如 print(1+1)）→ python_exec
+  用户只是提到一个名词、想查它是什么 → 那是 search，不要自己写 print
 
 不要输出 JSON，不要自己计算，不要解释。只要上面两行。"""
 
@@ -80,6 +81,27 @@ _ARG_KEY_OF = {
     "memory_remember": "text",
 }
 
+_CODE_HINTS = ("print(", "import ", "def ", "for ", "while ", "len(", "range(",
+               "sum(", "list(", "dict(", "set(", "open(", "os.", "sys.")
+
+
+def _has_code_keyword(text: str) -> bool:
+    """只查代码关键字（print/import/def...），**不看括号**。
+    ⚠️ 必须和 _looks_like_code 分开：算术表达式 "(132 + 868) * 3" 也有配对
+    括号，用括号判据会把正常算术题误判成代码 —— 实测踩过，导致
+    「计算 (132 + 868) * 3」被 calculator 分支拒绝，直接回归。
+    """
+    return any(h in text for h in _CODE_HINTS)
+
+
+def _looks_like_code(text: str) -> bool:
+    """判断文本里是否真的含可执行代码（而不是一个普通名词）。
+    两个信号任一成立即可：出现典型代码关键字，或含配对括号。
+    """
+    if _has_code_keyword(text):
+        return True
+    return text.count("(") > 0 and text.count(")") > 0
+
 
 def _tokenize_for_match(text: str):
     out, buf = [], ""
@@ -95,18 +117,6 @@ def _tokenize_for_match(text: str):
     if buf:
         out.append(buf)
     return out
-
-
-def _looks_like_code(text: str) -> bool:
-    """判断一段文本是否像 Python 代码。
-    诊断用：planner 选了 python_exec，但参数不像代码 → 可能是 search 误判。
-    """
-    t = text.strip()
-    if not t:
-        return False
-    code_signals = ["print(", "=", "def ", "import ", "(", ")", ".", "[", "]", "{", "}", "lambda", "return"]
-    hits = sum(1 for s in code_signals if s in t)
-    return hits >= 1 and len(t) >= 3
 
 
 class CascadeBackend(ModelBackend):
@@ -148,23 +158,28 @@ class CascadeBackend(ModelBackend):
         arg_key = _ARG_KEY_OF[tool]
 
         if tool == "calculator":
+            # 互斥检查：任务里若含代码关键字（print / import ...），
+            # 说明用户在让**执行代码**，不是让算算术
+            if _has_code_keyword(task):
+                return None
             m = re.search(r"\(?\s*\d[\d\s+\-*/().]*\d\s*\)?", task)
             if not m:
                 return None
             return {"tool": tool, "args": {arg_key: m.group(0).strip()}}
 
         if tool == "python_exec":
+            # 必须先确认任务里**真的有代码**：0.5B 会把「查查 Zyzzogeton」
+            # 判成 python_exec 并自己编 print('Zyzzogeton')
+            if not _looks_like_code(task):
+                return None
             body = task
             for verb in ("执行代码", "运行代码", "执行", "运行", "跑一下", "跑"):
                 if body.startswith(verb):
                     body = body[len(verb):]
                     break
             body = body.strip().strip("：: ")
-            if not body:
+            if not body or not _looks_like_code(body):
                 return None
-            # 诊断（不纠正）：planner 选了 python_exec，但任务里没有代码特征
-            if not _looks_like_code(body):
-                print(f"⚠️ [诊断] planner 选了 python_exec，但参数看起来不像代码: {body[:60]!r}")
             return {"tool": tool, "args": {arg_key: body}}
 
         m_arg = re.search(r"参数\s*[:：]\s*(.+)", plan)
