@@ -98,6 +98,9 @@ class _DemoPlanner(ModelBackend):
         return "工具名：未知"
 
 
+TOOLS_WHITELIST = None   # 由 --tools 覆盖
+
+
 def build(kind: str, model: str, evo_path: str, verbose: bool):
     evo = NumpyBackend(evo_path, constrained=True) if os.path.exists(evo_path) else None
     if evo is None:
@@ -118,7 +121,8 @@ def build(kind: str, model: str, evo_path: str, verbose: bool):
         planner = MockBackend()
     else:
         raise SystemExit(f"未知 planner: {kind}")
-    return CascadeBackend(planner=planner, formatter=evo, verbose=verbose)
+    return CascadeBackend(planner=planner, formatter=evo, verbose=verbose,
+                          tools=TOOLS_WHITELIST)
 
 
 def score(backend, label: str, show_plan: bool = False):
@@ -155,7 +159,16 @@ def main() -> None:
     ap.add_argument("--model", default="deepseek-chat")
     ap.add_argument("--evo", default="models/mnemo_sonnet_evo5.npz")
     ap.add_argument("--verbose", action="store_true", help="打印 planner 的原始推理")
+    ap.add_argument("--tools", default=None,
+                    help="只给 planner 看这些工具，逗号分隔。"
+                         "例：--tools calculator,search,file_write,python_exec "
+                         "（去掉 memory_* 可减少小模型混淆）")
     args = ap.parse_args()
+
+    global TOOLS_WHITELIST
+    if args.tools:
+        TOOLS_WHITELIST = [t.strip() for t in args.tools.split(",") if t.strip()]
+        print(f"⚠️ 工具白名单: {TOOLS_WHITELIST}")
 
     backend = build(args.planner, args.model, args.evo, args.verbose)
     if args.planner != "none":
